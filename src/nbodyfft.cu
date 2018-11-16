@@ -98,12 +98,16 @@ __global__ void copy_from_fft_output(volatile float * __restrict__ y_tilde_value
     y_tilde_values[current_term + n_terms * current_loc] = fft_output[current_term * (n_fft_coeffs * n_fft_coeffs) + i * n_fft_coeffs + j] / (float) (n_fft_coeffs * n_fft_coeffs);
 }
 
-__global__ void compute_point_box_idx(volatile int *point_box_idx,
-                                      const float *xs,
-                                      const float *ys,
+__global__ void compute_point_box_idx(volatile int * __restrict__ point_box_idx,
+                                      volatile float * __restrict__ x_in_box,
+                                      volatile float * __restrict__ y_in_box,
+                                      const float * const xs,
+                                      const float * const ys,
+                                      const float * const box_lower_bounds,
                                       const float coord_min,
                                       const float box_width,
                                       const int n_boxes,
+                                      const int n_total_boxes,
                                       const int N) 
 {
     register int TID = threadIdx.x + blockIdx.x * blockDim.x;
@@ -119,7 +123,11 @@ __global__ void compute_point_box_idx(volatile int *point_box_idx,
     y_idx = max(0, y_idx);
     y_idx = min(n_boxes - 1, y_idx);
 
-    point_box_idx[TID] = y_idx * n_boxes + x_idx;
+    register int box_idx = y_idx * n_boxes + x_idx;
+    point_box_idx[TID] = box_idx;
+
+    x_in_box[TID] = (xs[TID] - box_lower_bounds[box_idx]) / box_width;
+    y_in_box[TID] = (ys[TID] - box_lower_bounds[n_total_boxes + box_idx]) / box_width;
 }
 
 void precompute_2d(float x_max, float x_min, float y_max, float y_min, int n_boxes, int n_interpolation_points,
@@ -200,30 +208,40 @@ void n_body_fft_2d(int N, int n_terms, float *xs, float *ys, float *chargesQij, 
 
     // auto *point_box_idx = new int[N];
     thrust::device_vector<int> point_box_idx_device(N);
+    thrust::device_vector<float> x_in_box_device(N);
+    thrust::device_vector<float> y_in_box_device(N);
     thrust::device_vector<float> xs_device(xs, xs + N);
     thrust::device_vector<float> ys_device(ys, ys + N);
+    thrust::device_vector<float> box_lower_bounds_device(box_lower_bounds, box_lower_bounds + 2 * n_total_boxes);
     compute_point_box_idx<<<num_blocks, num_threads>>>(
         thrust::raw_pointer_cast(point_box_idx_device.data()),
+        thrust::raw_pointer_cast(x_in_box_device.data()),
+        thrust::raw_pointer_cast(y_in_box_device.data()),
         thrust::raw_pointer_cast(xs_device.data()), 
         thrust::raw_pointer_cast(ys_device.data()),
+        thrust::raw_pointer_cast(box_lower_bounds_device.data()),
         coord_min,
         box_width,
         n_boxes,
+        n_total_boxes,
         N
     );
+
     GpuErrorCheck(cudaDeviceSynchronize());
     thrust::host_vector<int> point_box_idx(point_box_idx_device.begin(), point_box_idx_device.end());
+    thrust::host_vector<float> x_in_box(x_in_box_device.begin(), x_in_box_device.end());
+    thrust::host_vector<float> y_in_box(y_in_box_device.begin(), y_in_box_device.end());
 
     // Compute the relative position of each point in its box in the interval [0, 1]
-    auto *x_in_box = new float[N];
-    auto *y_in_box = new float[N];
-    for (int i = 0; i < N; i++) {
-        int box_idx = point_box_idx[i];
-        float x_min = box_lower_bounds[box_idx];
-        float y_min = box_lower_bounds[n_total_boxes + box_idx];
-        x_in_box[i] = (xs[i] - x_min) / box_width;
-        y_in_box[i] = (ys[i] - y_min) / box_width;
-    }
+    // auto *x_in_box = new float[N];
+    // auto *y_in_box = new float[N];
+    // for (int i = 0; i < N; i++) {
+    //     int box_idx = point_box_idx[i];
+    //     float x_min = box_lower_bounds[box_idx];
+    //     float y_min = box_lower_bounds[n_total_boxes + box_idx];
+    //     x_in_box[i] = (xs[i] - x_min) / box_width;
+    //     y_in_box[i] = (ys[i] - y_min) / box_width;
+    // }
 
     INITIALIZE_TIME
     START_TIME
@@ -233,10 +251,10 @@ void n_body_fft_2d(int N, int n_terms, float *xs, float *ys, float *chargesQij, 
      */
     // Compute the interpolated values at each real point with each Lagrange polynomial in the `x` direction
     auto *x_interpolated_values = new float[N * n_interpolation_points];
-    interpolate(n_interpolation_points, N, x_in_box, y_tilde_spacings, x_interpolated_values);
+    interpolate(n_interpolation_points, N, thrust::raw_pointer_cast(x_in_box.data()), y_tilde_spacings, x_interpolated_values);
     // Compute the interpolated values at each real point with each Lagrange polynomial in the `y` direction
     auto *y_interpolated_values = new float[N * n_interpolation_points];
-    interpolate(n_interpolation_points, N, y_in_box, y_tilde_spacings, y_interpolated_values);
+    interpolate(n_interpolation_points, N, thrust::raw_pointer_cast(y_in_box.data()), y_tilde_spacings, y_interpolated_values);
 
     auto *w_coefficients = new float[total_interpolation_points * n_terms]();
     for (int i = 0; i < N; i++) {
@@ -369,8 +387,8 @@ void n_body_fft_2d(int N, int n_terms, float *xs, float *ys, float *chargesQij, 
     delete[] y_interpolated_values;
     delete[] w_coefficients;
     // delete[] y_tilde_values;
-    delete[] x_in_box;
-    delete[] y_in_box;
+    // delete[] x_in_box;
+    // delete[] y_in_box;
 
     // std::cout << "done" << std::endl;
 }
