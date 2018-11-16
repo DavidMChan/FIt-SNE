@@ -10,27 +10,27 @@
 
 using namespace std;
 
-typedef double (*kernel_type)(double, double);
+typedef float (*kernel_type)(float, float);
 
-typedef double (*kernel_type_2d)(double, double, double, double);
+typedef float (*kernel_type_2d)(float, float, float, float);
 
-void precompute_2d(double x_max, double x_min, double y_max, double y_min, int n_boxes, int n_interpolation_points,
-                   kernel_type_2d kernel, double *box_lower_bounds, double *box_upper_bounds, double *y_tilde_spacings,
-                   double *y_tilde, double *x_tilde, complex<double> *fft_kernel_tilde);
+void precompute_2d(float x_max, float x_min, float y_max, float y_min, int n_boxes, int n_interpolation_points,
+                   kernel_type_2d kernel, float *box_lower_bounds, float *box_upper_bounds, float *y_tilde_spacings,
+                   float *y_tilde, float *x_tilde, complex<float> *fft_kernel_tilde);
 
-void n_body_fft_2d(int N, int n_terms, double *xs, double *ys, double *chargesQij, int n_boxes,
-                   int n_interpolation_points, double *box_lower_bounds, double *box_upper_bounds,
-                   double *y_tilde_spacings, complex<double> *fft_kernel_tilde, double *potentialQij, unsigned int nthreads);
+void n_body_fft_2d(int N, int n_terms, float *xs, float *ys, float *chargesQij, int n_boxes,
+                   int n_interpolation_points, float *box_lower_bounds, float *box_upper_bounds,
+                   float *y_tilde_spacings, complex<float> *fft_kernel_tilde, float *potentialQij, unsigned int nthreads);
 
-void precompute(double y_min, double y_max, int n_boxes, int n_interpolation_points, kernel_type kernel,
-                double *box_lower_bounds, double *box_upper_bounds, double *y_tilde_spacing, double *y_tilde,
-                complex<double> *fft_kernel_vector);
+void precompute(float y_min, float y_max, int n_boxes, int n_interpolation_points, kernel_type kernel,
+                float *box_lower_bounds, float *box_upper_bounds, float *y_tilde_spacing, float *y_tilde,
+                complex<float> *fft_kernel_vector);
 
-void nbodyfft(int N, int n_terms, double *Y, double *chargesQij, int n_boxes, int n_interpolation_points,
-              double *box_lower_bounds, double *box_upper_bounds, double *y_tilde_spacings, double *y_tilde,
-              complex<double> *fft_kernel_vector, double *potentialsQij);
+void nbodyfft(int N, int n_terms, float *Y, float *chargesQij, int n_boxes, int n_interpolation_points,
+              float *box_lower_bounds, float *box_upper_bounds, float *y_tilde_spacings, float *y_tilde,
+              complex<float> *fft_kernel_vector, float *potentialsQij);
 
-void interpolate(int n_interpolation_points, int N, const double *y_in_box, const double *y_tilde_spacings,
-                 double *interpolated_values);
+void interpolate(int n_interpolation_points, int N, const float *y_in_box, const float *y_tilde_spacings,
+                 float *interpolated_values);
 
 #endif
