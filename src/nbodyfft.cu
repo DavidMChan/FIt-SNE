@@ -7,6 +7,7 @@
 #include "common.h"
 #include "include/util/cuda_utils.h"
 #include <thrust/complex.h>
+#include "include/util/matrix_broadcast_utils.h"
 
 #define cufftSafeCall(err)  __cufftSafeCall(err, __FILE__, __LINE__)
 
@@ -285,21 +286,29 @@ void n_body_fft_2d(int N, int n_terms, float *xs, float *ys, float *chargesQij, 
 
     size_t work_size_dft, work_size_idft;
     int n[2] = {n_fft_coeffs, n_fft_coeffs};
-    cufftSafeCall(cufftGetSize2d(plan_dft, n_fft_coeffs, n_fft_coeffs, CUFFT_R2C, &work_size_dft));
-    // cufftSafeCall(cufftGetSizeMany(plan_dft, 2, n, 
-    //                                NULL, 1, 0,
-    //                                NULL, 1, 0,
-    //                                CUFFT_R2C, 1, &work_size_dft));
-    cufftSafeCall(cufftGetSize2d(plan_idft, n_fft_coeffs, n_fft_coeffs, CUFFT_C2R, &work_size_idft));
+    // cufftSafeCall(cufftGetSize2d(plan_dft, n_fft_coeffs, n_fft_coeffs, CUFFT_R2C, &work_size_dft));
+    cufftSafeCall(cufftGetSizeMany(plan_dft, 2, n, 
+                                   NULL, 1, n_fft_coeffs * n_fft_coeffs,
+                                   NULL, 1, n_fft_coeffs * (n_fft_coeffs / 2 + 1),
+                                   CUFFT_R2C, n_terms, &work_size_dft));
+    // cufftSafeCall(cufftGetSize2d(plan_idft, n_fft_coeffs, n_fft_coeffs, CUFFT_C2R, &work_size_idft));
+    cufftSafeCall(cufftGetSizeMany(plan_idft, 2, n, 
+                                    NULL, 1, n_fft_coeffs * (n_fft_coeffs / 2 + 1),
+                                    NULL, 1, n_fft_coeffs * n_fft_coeffs,
+                                    CUFFT_C2R, n_terms, &work_size_idft));
 
     // std::cout << work_size_dft << "," << work_size_idft << std::endl;
 
-    cufftSafeCall(cufftMakePlan2d(plan_dft, n_fft_coeffs, n_fft_coeffs, CUFFT_R2C, &work_size_dft));
-    // cufftSafeCall(cufftMakePlanMany(plan_dft, 2, n, 
-    //                                 NULL, 1, 0,
-    //                                 NULL, 1, 0,
-    //                                 CUFFT_R2C, 1, &work_size_dft));
-    cufftSafeCall(cufftMakePlan2d(plan_idft, n_fft_coeffs, n_fft_coeffs, CUFFT_C2R, &work_size_idft));
+    // cufftSafeCall(cufftMakePlan2d(plan_dft, n_fft_coeffs, n_fft_coeffs, CUFFT_R2C, &work_size_dft));
+    cufftSafeCall(cufftMakePlanMany(plan_dft, 2, n, 
+                                    NULL, 1, n_fft_coeffs * n_fft_coeffs,
+                                    NULL, 1, n_fft_coeffs * (n_fft_coeffs / 2 + 1),
+                                    CUFFT_R2C, n_terms, &work_size_dft));
+    // cufftSafeCall(cufftMakePlan2d(plan_idft, n_fft_coeffs, n_fft_coeffs, CUFFT_C2R, &work_size_idft));
+    cufftSafeCall(cufftMakePlanMany(plan_idft, 2, n, 
+                                    NULL, 1, n_fft_coeffs * (n_fft_coeffs / 2 + 1),
+                                    NULL, 1, n_fft_coeffs * n_fft_coeffs,
+                                    CUFFT_C2R, n_terms, &work_size_idft));
     
     const int num_threads = 32;
     int num_blocks = ((n_terms * n_fft_coeffs_half * n_fft_coeffs_half) + num_threads - 1) / num_threads;
@@ -312,32 +321,33 @@ void n_body_fft_2d(int N, int n_terms, float *xs, float *ys, float *chargesQij, 
     );
     GpuErrorCheck(cudaDeviceSynchronize());
 
-    // cufftExecR2C(plan_dft, 
-    //     reinterpret_cast<cufftReal *>(thrust::raw_pointer_cast(fft_input.data())), 
-    //     reinterpret_cast<cufftComplex *>(thrust::raw_pointer_cast(fft_w_coefficients.data())));
-    // GpuErrorCheck(cudaDeviceSynchronize());
+    // Compute fft values at interpolated nodes
+    cufftExecR2C(plan_dft, 
+        reinterpret_cast<cufftReal *>(thrust::raw_pointer_cast(fft_input.data())), 
+        reinterpret_cast<cufftComplex *>(thrust::raw_pointer_cast(fft_w_coefficients.data())));
+    GpuErrorCheck(cudaDeviceSynchronize());
 
-    for (int d = 0; d < n_terms; d++) {
-        cufftExecR2C(plan_dft, 
-                     reinterpret_cast<cufftReal *>(thrust::raw_pointer_cast(fft_input.data() + d * n_fft_coeffs * n_fft_coeffs)), 
-                     reinterpret_cast<cufftComplex *>(thrust::raw_pointer_cast(fft_w_coefficients.data() + d * n_fft_coeffs * (n_fft_coeffs / 2 + 1))));
-        GpuErrorCheck(cudaDeviceSynchronize());
+    tsnecuda::util::BroadcastMatrixVector(
+        fft_w_coefficients, fft_kernel_tilde_device, n_fft_coeffs * (n_fft_coeffs / 2 + 1), n_terms, 
+        thrust::multiplies<thrust::complex<float>>(), 0, thrust::complex<float>(1.0));
 
+    // Take the broadcasted Hadamard product of a complex matrix and a complex vector
+    // for (int d = 0; d < n_terms; d++) {
 
-        // Take the Hadamard product of two complex vectors
-        thrust::transform(
-                fft_w_coefficients.begin() + d * n_fft_coeffs * (n_fft_coeffs / 2 + 1), 
-                fft_w_coefficients.begin() + (d + 1) * n_fft_coeffs * (n_fft_coeffs / 2 + 1), 
-                fft_kernel_tilde_device.begin(), 
-                fft_w_coefficients.begin() + d * n_fft_coeffs * (n_fft_coeffs / 2 + 1), 
-                thrust::multiplies<thrust::complex<float>>());
+    //     // Take the Hadamard product of two complex vectors
+    //     thrust::transform(
+    //             fft_w_coefficients.begin() + d * n_fft_coeffs * (n_fft_coeffs / 2 + 1), 
+    //             fft_w_coefficients.begin() + (d + 1) * n_fft_coeffs * (n_fft_coeffs / 2 + 1), 
+    //             fft_kernel_tilde_device.begin(), 
+    //             fft_w_coefficients.begin() + d * n_fft_coeffs * (n_fft_coeffs / 2 + 1), 
+    //             thrust::multiplies<thrust::complex<float>>());
+    // }
 
-        // Invert the computed values at the interpolated nodes
-        cufftExecC2R(plan_idft, 
-                     reinterpret_cast<cufftComplex *>(thrust::raw_pointer_cast(fft_w_coefficients.data() + d * n_fft_coeffs * (n_fft_coeffs / 2 + 1))), 
-                     reinterpret_cast<cufftReal *>(thrust::raw_pointer_cast(fft_output.data() + d * n_fft_coeffs * n_fft_coeffs)));
-        GpuErrorCheck(cudaDeviceSynchronize());
-    }
+    // Invert the computed values at the interpolated nodes
+    cufftExecC2R(plan_idft, 
+        reinterpret_cast<cufftComplex *>(thrust::raw_pointer_cast(fft_w_coefficients.data())), 
+        reinterpret_cast<cufftReal *>(thrust::raw_pointer_cast(fft_output.data())));
+    GpuErrorCheck(cudaDeviceSynchronize());
 
     copy_from_fft_output<<<num_blocks, num_threads>>>(
         thrust::raw_pointer_cast(y_tilde_values.data()),
