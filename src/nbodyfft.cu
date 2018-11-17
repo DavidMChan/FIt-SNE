@@ -130,6 +130,49 @@ __global__ void compute_point_box_idx(volatile int * __restrict__ point_box_idx,
     y_in_box[TID] = (ys[TID] - box_lower_bounds[n_total_boxes + box_idx]) / box_width;
 }
 
+__global__ void interpolate_device(
+    volatile float * __restrict__ interpolated_values,
+    const float * const y_in_box,
+    const float * const y_tilde_spacings,
+    const float * const denominator,
+    const int n_interpolation_points,
+    const int N)
+{
+    register int TID, i, j, k;
+    register float value, ybox_i;
+
+    TID = threadIdx.x + blockIdx.x * blockDim.x;
+    if (TID >= N * n_interpolation_points)
+        return;
+
+    i = TID % N;
+    j = TID / N;
+    
+    value = 1;
+    ybox_i = y_in_box[i];
+
+    for (k = 0; k < n_interpolation_points; k++) {
+        if (j != k) {
+            value *= ybox_i - y_tilde_spacings[k];
+        }
+    }
+
+    interpolated_values[j * N + i] = value / denominator[j];
+}
+
+// for (int i = 0; i < N; i++) {
+//     for (int j = 0; j < n_interpolation_points; j++) {
+//         interpolated_values[j * N + i] = 1;
+//         for (int k = 0; k < n_interpolation_points; k++) {
+//             if (j != k) {
+//                 interpolated_values[j * N + i] *= y_in_box[i] - y_tilde_spacings[k];
+//             }
+//         }
+//         interpolated_values[j * N + i] /= denominator[j];
+//     }
+// }
+
+
 void precompute_2d(float x_max, float x_min, float y_max, float y_min, int n_boxes, int n_interpolation_points,
                    kernel_type_2d kernel, float *box_lower_bounds, float *box_upper_bounds, float *y_tilde_spacings,
                    float *y_tilde, float *x_tilde, complex<float> *fft_kernel_tilde) {
@@ -196,7 +239,7 @@ void precompute_2d(float x_max, float x_min, float y_max, float y_min, int n_box
 
 void n_body_fft_2d(int N, int n_terms, float *xs, float *ys, float *chargesQij, int n_boxes,
                    int n_interpolation_points, float *box_lower_bounds, float *box_upper_bounds,
-                   float *y_tilde_spacings, complex<float> *fft_kernel_tilde, float *potentialQij, unsigned int nthreads) {
+                   float *y_tilde_spacings, complex<float> *fft_kernel_tilde, float *potentialQij, const float *denominator, unsigned int nthreads) {
     // std::cout << "start" << std::endl;
     const int num_threads = 1024;
     int num_blocks = (N + num_threads - 1) / num_threads;
@@ -213,6 +256,10 @@ void n_body_fft_2d(int N, int n_terms, float *xs, float *ys, float *chargesQij, 
     thrust::device_vector<float> xs_device(xs, xs + N);
     thrust::device_vector<float> ys_device(ys, ys + N);
     thrust::device_vector<float> box_lower_bounds_device(box_lower_bounds, box_lower_bounds + 2 * n_total_boxes);
+    thrust::device_vector<float> y_tilde_spacings_device(y_tilde_spacings, y_tilde_spacings + n_interpolation_points);
+    thrust::device_vector<float> denominator_device(denominator, denominator + n_interpolation_points);
+
+     // Compute box indices and the relative position of each point in its box in the interval [0, 1]
     compute_point_box_idx<<<num_blocks, num_threads>>>(
         thrust::raw_pointer_cast(point_box_idx_device.data()),
         thrust::raw_pointer_cast(x_in_box_device.data()),
@@ -232,17 +279,6 @@ void n_body_fft_2d(int N, int n_terms, float *xs, float *ys, float *chargesQij, 
     thrust::host_vector<float> x_in_box(x_in_box_device.begin(), x_in_box_device.end());
     thrust::host_vector<float> y_in_box(y_in_box_device.begin(), y_in_box_device.end());
 
-    // Compute the relative position of each point in its box in the interval [0, 1]
-    // auto *x_in_box = new float[N];
-    // auto *y_in_box = new float[N];
-    // for (int i = 0; i < N; i++) {
-    //     int box_idx = point_box_idx[i];
-    //     float x_min = box_lower_bounds[box_idx];
-    //     float y_min = box_lower_bounds[n_total_boxes + box_idx];
-    //     x_in_box[i] = (xs[i] - x_min) / box_width;
-    //     y_in_box[i] = (ys[i] - y_min) / box_width;
-    // }
-
     INITIALIZE_TIME
     START_TIME
 
@@ -250,13 +286,41 @@ void n_body_fft_2d(int N, int n_terms, float *xs, float *ys, float *chargesQij, 
      * Step 1: Interpolate kernel using Lagrange polynomials and compute the w coefficients
      */
     // Compute the interpolated values at each real point with each Lagrange polynomial in the `x` direction
-    auto *x_interpolated_values = new float[N * n_interpolation_points];
-    interpolate(n_interpolation_points, N, thrust::raw_pointer_cast(x_in_box.data()), y_tilde_spacings, x_interpolated_values);
-    // Compute the interpolated values at each real point with each Lagrange polynomial in the `y` direction
-    auto *y_interpolated_values = new float[N * n_interpolation_points];
-    interpolate(n_interpolation_points, N, thrust::raw_pointer_cast(y_in_box.data()), y_tilde_spacings, y_interpolated_values);
+    
+    thrust::device_vector<float> x_interpolated_values_device(N * n_interpolation_points);
+    thrust::device_vector<float> y_interpolated_values_device(N * n_interpolation_points);
+
+    num_blocks = (N * n_interpolation_points + num_threads - 1) / num_threads;
+    interpolate_device<<<num_blocks, num_threads>>>(
+        thrust::raw_pointer_cast(x_interpolated_values_device.data()),
+        thrust::raw_pointer_cast(x_in_box_device.data()),
+        thrust::raw_pointer_cast(y_tilde_spacings_device.data()),
+        thrust::raw_pointer_cast(denominator_device.data()),
+        n_interpolation_points,
+        N
+    );
+    GpuErrorCheck(cudaDeviceSynchronize());
+
+    interpolate_device<<<num_blocks, num_threads>>>(
+        thrust::raw_pointer_cast(y_interpolated_values_device.data()),
+        thrust::raw_pointer_cast(y_in_box_device.data()),
+        thrust::raw_pointer_cast(y_tilde_spacings_device.data()),
+        thrust::raw_pointer_cast(denominator_device.data()),
+        n_interpolation_points,
+        N
+    );
+    GpuErrorCheck(cudaDeviceSynchronize());
+
+    thrust::host_vector<float> x_interpolated_values(x_interpolated_values_device.begin(), x_interpolated_values_device.end());
+    thrust::host_vector<float> y_interpolated_values(y_interpolated_values_device.begin(), y_interpolated_values_device.end());
+    // auto *x_interpolated_values = new float[N * n_interpolation_points];
+    // interpolate(n_interpolation_points, N, thrust::raw_pointer_cast(x_in_box.data()), y_tilde_spacings, x_interpolated_values, denominator);
+    // // Compute the interpolated values at each real point with each Lagrange polynomial in the `y` direction
+    // auto *y_interpolated_values = new float[N * n_interpolation_points];
+    // interpolate(n_interpolation_points, N, thrust::raw_pointer_cast(y_in_box.data()), y_tilde_spacings, y_interpolated_values, denominator);
 
     auto *w_coefficients = new float[total_interpolation_points * n_terms]();
+    thrust::device_vecor<float> w_coefficients_device(total_interpolation_points * n_terms);
     for (int i = 0; i < N; i++) {
         int box_idx = point_box_idx[i];
         int box_j = box_idx / n_boxes;
@@ -284,7 +348,7 @@ void n_body_fft_2d(int N, int n_terms, float *xs, float *ys, float *chargesQij, 
     int n_fft_coeffs_half = n_interpolation_points * n_boxes;
     int n_fft_coeffs = 2 * n_interpolation_points * n_boxes;
     
-    thrust::device_vector<float> w_coefficients_device(w_coefficients, w_coefficients + (total_interpolation_points * n_terms ));
+    // thrust::device_vector<float> w_coefficients_device(w_coefficients, w_coefficients + (total_interpolation_points * n_terms ));
     thrust::device_vector<float> y_tilde_values(total_interpolation_points * n_terms);
 
     // FFT of fft_input
@@ -383,8 +447,8 @@ void n_body_fft_2d(int N, int n_terms, float *xs, float *ys, float *chargesQij, 
     });
     END_TIME("Step 3");
     // delete[] point_box_idx;
-    delete[] x_interpolated_values;
-    delete[] y_interpolated_values;
+    // delete[] x_interpolated_values;
+    // delete[] y_interpolated_values;
     delete[] w_coefficients;
     // delete[] y_tilde_values;
     // delete[] x_in_box;
@@ -394,77 +458,19 @@ void n_body_fft_2d(int N, int n_terms, float *xs, float *ys, float *chargesQij, 
 }
 
 
-void precompute(float y_min, float y_max, int n_boxes, int n_interpolation_points, kernel_type kernel,
-                float *box_lower_bounds, float *box_upper_bounds, float *y_tilde_spacing, float *y_tilde,
-                complex<float> *fft_kernel_vector) {
-    /*
-     * Set up the boxes
-     */
-    float box_width = (y_max - y_min) / (float) n_boxes;
-    // Compute the left and right bounds of each box
-    for (int box_idx = 0; box_idx < n_boxes; box_idx++) {
-        box_lower_bounds[box_idx] = box_idx * box_width + y_min;
-        box_upper_bounds[box_idx] = (box_idx + 1) * box_width + y_min;
-    }
-
-    int total_interpolation_points = n_interpolation_points * n_boxes;
-    // Coordinates of each equispaced interpolation point for a single box. This equally spaces them between [0, 1]
-    // with equal space between the points and half that space between the boundary point and the closest boundary point
-    // e.g. [0.1, 0.3, 0.5, 0.7, 0.9] with spacings [0.1, 0.2, 0.2, 0.2, 0.2, 0.1], respectively. This ensures that the
-    // nodes will still be equispaced across box boundaries
-    float h = 1 / (float) n_interpolation_points;
-    y_tilde_spacing[0] = h / 2;
-    for (int i = 1; i < n_interpolation_points; i++) {
-        y_tilde_spacing[i] = y_tilde_spacing[i - 1] + h;
-    }
-
-    // Coordinates of all the equispaced interpolation points
-    h = h * box_width;
-    y_tilde[0] = y_min + h / 2;
-    for (int i = 1; i < total_interpolation_points; i++) {
-        y_tilde[i] = y_tilde[i - 1] + h;
-    }
-
-    /*
-     * Evaluate the kernel at the interpolation nodes and form the embedded generating kernel vector for a circulant
-     * matrix
-     */
-    auto *kernel_vector = new complex<float>[2 * total_interpolation_points]();
-    // Compute the generating vector x between points K(y_i, y_j) where i = 0, j = 0:N-1
-    // [0 0 0 0 0 5 4 3 2 1] for linear kernel
-    // This evaluates the Cauchy kernel centered on y_tilde[0] to all the other points
-    for (int i = 0; i < total_interpolation_points; i++) {
-        kernel_vector[total_interpolation_points + i].real(kernel(y_tilde[0], y_tilde[i]));
-    }
-    // This part symmetrizes the vector, this embeds the Toeplitz generating vector into the circulant generating vector
-    // but also has the nice property of symmetrizing the Cauchy kernel, which is probably planned
-    // [0 1 2 3 4 5 4 3 2 1] for linear kernel
-    for (int i = 1; i < total_interpolation_points; i++) {
-        kernel_vector[i].real(kernel_vector[2 * total_interpolation_points - i].real());
-    }
-
-    // Precompute the FFT of the kernel generating vector
-    fftwf_plan p = fftwf_plan_dft_1d(2 * total_interpolation_points, reinterpret_cast<fftwf_complex *>(kernel_vector),
-                                   reinterpret_cast<fftwf_complex *>(fft_kernel_vector), FFTW_FORWARD, FFTW_ESTIMATE);
-    fftwf_execute(p);
-    fftwf_destroy_plan(p);
-
-    delete[] kernel_vector;
-}
-
-
 void interpolate(int n_interpolation_points, int N, const float *y_in_box, const float *y_tilde_spacings,
-                 float *interpolated_values) {
+                 float *interpolated_values, const float *denominator) {
     // The denominators are the same across the interpolants, so we only need to compute them once
-    auto *denominator = new float[n_interpolation_points];
-    for (int i = 0; i < n_interpolation_points; i++) {
-        denominator[i] = 1;
-        for (int j = 0; j < n_interpolation_points; j++) {
-            if (i != j) {
-                denominator[i] *= y_tilde_spacings[i] - y_tilde_spacings[j];
-            }
-        }
-    }
+    // auto *denominator = new float[n_interpolation_points];
+    // for (int i = 0; i < n_interpolation_points; i++) {
+    //     denominator[i] = 1;
+    //     for (int j = 0; j < n_interpolation_points; j++) {
+    //         if (i != j) {
+    //             denominator[i] *= y_tilde_spacings[i] - y_tilde_spacings[j];
+    //         }
+    //     }
+    // }
+
     // Compute the numerators and the interpolant value
     for (int i = 0; i < N; i++) {
         for (int j = 0; j < n_interpolation_points; j++) {
@@ -478,124 +484,5 @@ void interpolate(int n_interpolation_points, int N, const float *y_in_box, const
         }
     }
 
-    delete[] denominator;
-}
-
-
-void nbodyfft(int N, int n_terms, float *Y, float *chargesQij, int n_boxes, int n_interpolation_points,
-              float *box_lower_bounds, float *box_upper_bounds, float *y_tilde_spacings, float *y_tilde,
-              complex<float> *fft_kernel_vector, float *potentialsQij) {
-    int total_interpolation_points = n_interpolation_points * n_boxes;
-
-    float coord_min = box_lower_bounds[0];
-    float box_width = box_upper_bounds[0] - box_lower_bounds[0];
-
-    // Determine which box each point belongs to
-    auto *point_box_idx = new int[N];
-    for (int i = 0; i < N; i++) {
-        auto box_idx = static_cast<int>((Y[i] - coord_min) / box_width);
-        // The right most point maps directly into `n_boxes`, while it should belong to the last box
-        if (box_idx >= n_boxes) {
-            box_idx = n_boxes - 1;
-        }
-        point_box_idx[i] = box_idx;
-    }
-
-    // Compute the relative position of each point in its box in the interval [0, 1]
-    auto *y_in_box = new float[N];
-    for (int i = 0; i < N; i++) {
-        int box_idx = point_box_idx[i];
-        float box_min = box_lower_bounds[box_idx];
-        y_in_box[i] = (Y[i] - box_min) / box_width;
-    }
-
-    /*
-     * Step 1: Interpolate kernel using Lagrange polynomials and compute the w coefficients
-     */
-    // Compute the interpolated values at each real point with each Lagrange polynomial
-    auto *interpolated_values = new float[n_interpolation_points * N];
-    interpolate(n_interpolation_points, N, y_in_box, y_tilde_spacings, interpolated_values);
-
-    auto *w_coefficients = new float[total_interpolation_points * n_terms]();
-    for (int i = 0; i < N; i++) {
-        int box_idx = point_box_idx[i] * n_interpolation_points;
-        for (int interp_idx = 0; interp_idx < n_interpolation_points; interp_idx++) {
-            for (int d = 0; d < n_terms; d++) {
-                w_coefficients[(box_idx + interp_idx) * n_terms + d] +=
-                        interpolated_values[interp_idx * N + i] * chargesQij[i * n_terms + d];
-            }
-        }
-    }
-
-    // `embedded_w_coefficients` is just a vector of zeros prepended to `w_coefficients`, this (probably) matches the
-    // dimensions of the kernel matrix K and since we embedded the generating vector by prepending values, we have to do
-    // the same here
-    auto *embedded_w_coefficients = new float[2 * total_interpolation_points * n_terms]();
-    for (int i = 0; i < total_interpolation_points; i++) {
-        for (int d = 0; d < n_terms; d++) {
-            embedded_w_coefficients[(total_interpolation_points + i) * n_terms + d] = w_coefficients[i * n_terms + d];
-        }
-    }
-
-    /*
-     * Step 2: Compute the values v_{m, n} at the equispaced nodes, multiply the kernel matrix with the coefficients w
-     */
-    auto *fft_w_coefficients = new complex<float>[2 * total_interpolation_points];
-    auto *y_tilde_values = new float[total_interpolation_points * n_terms]();
-
-    fftwf_plan plan_dft, plan_idft;
-    plan_dft = fftwf_plan_dft_1d(2 * total_interpolation_points, reinterpret_cast<fftwf_complex *>(fft_w_coefficients),
-                                reinterpret_cast<fftwf_complex *>(fft_w_coefficients), FFTW_FORWARD, FFTW_ESTIMATE);
-    plan_idft = fftwf_plan_dft_1d(2 * total_interpolation_points, reinterpret_cast<fftwf_complex *>(fft_w_coefficients),
-                                 reinterpret_cast<fftwf_complex *>(fft_w_coefficients), FFTW_BACKWARD, FFTW_ESTIMATE);
-
-    for (int d = 0; d < n_terms; d++) {
-        for (int i = 0; i < 2 * total_interpolation_points; i++) {
-            fft_w_coefficients[i].real(embedded_w_coefficients[i * n_terms + d]);
-        }
-        fftwf_execute(plan_dft);
-
-        // Take the Hadamard product of two complex vectors
-        for (int i = 0; i < 2 * total_interpolation_points; i++) {
-            float x_ = fft_w_coefficients[i].real();
-            float y_ = fft_w_coefficients[i].imag();
-            float u_ = fft_kernel_vector[i].real();
-            float v_ = fft_kernel_vector[i].imag();
-            fft_w_coefficients[i].real(x_ * u_ - y_ * v_);
-            fft_w_coefficients[i].imag(x_ * v_ + y_ * u_);
-        }
-
-        // Invert the computed values at the interpolated nodes, unfortunate naming but it's better to do IDFT inplace
-        fftwf_execute(plan_idft);
-
-        for (int i = 0; i < total_interpolation_points; i++) {
-            // FFTW doesn't perform IDFT normalization, so we have to do it ourselves. This is done by multiplying the
-            // result with the number of points in the input
-            y_tilde_values[i * n_terms + d] = fft_w_coefficients[i].real() / (total_interpolation_points * 2.0);
-        }
-    }
-
-    fftwf_destroy_plan(plan_dft);
-    fftwf_destroy_plan(plan_idft);
-    delete[] fft_w_coefficients;
-
-    /*
-     * Step 3: Compute the potentials \tilde{\phi}
-     */
-    for (int i = 0; i < N; i++) {
-        int box_idx = point_box_idx[i] * n_interpolation_points;
-        for (int j = 0; j < n_interpolation_points; j++) {
-            for (int d = 0; d < n_terms; d++) {
-                potentialsQij[i * n_terms + d] +=
-                        interpolated_values[j * N + i] * y_tilde_values[(box_idx + j) * n_terms + d];
-            }
-        }
-    }
-
-    delete[] point_box_idx;
-    delete[] y_in_box;
-    delete[] interpolated_values;
-    delete[] w_coefficients;
-    delete[] y_tilde_values;
-    delete[] embedded_w_coefficients;
+    // delete[] denominator;
 }
