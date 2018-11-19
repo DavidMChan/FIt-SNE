@@ -160,18 +160,38 @@ __global__ void interpolate_device(
     interpolated_values[j * N + i] = value / denominator[j];
 }
 
-// for (int i = 0; i < N; i++) {
-//     for (int j = 0; j < n_interpolation_points; j++) {
-//         interpolated_values[j * N + i] = 1;
-//         for (int k = 0; k < n_interpolation_points; k++) {
-//             if (j != k) {
-//                 interpolated_values[j * N + i] *= y_in_box[i] - y_tilde_spacings[k];
-//             }
-//         }
-//         interpolated_values[j * N + i] /= denominator[j];
-//     }
-// }
+__global__ void compute_interpolated_indices(
+    volatile float * __restrict__ interpolated_values,
+    volatile int * __restrict__ interpolated_indices,
+    const int * const point_box_indices,
+    const float * const chargesQij,
+    const float * const x_interpolated_values,
+    const float * const y_interpolated_values,
+    const int N,
+    const int n_interpolation_points,
+    const int n_boxes,
+    const int n_terms)
+{
+    register int TID, current_term, i, interp_i, interp_j, box_idx, box_i, box_j, idx;
+    TID = threadIdx.x + blockIdx.x * blockDim.x;
+    if (TID >= n_terms * n_interpolation_points * n_interpolation_points * N)
+        return;
+    
+    current_term = TID % n_terms;
+    i = (TID / n_terms) % N;
+    interp_j = ((TID / n_terms) / N) % n_interpolation_points;
+    interp_i = ((TID / n_terms) / N) / n_interpolation_points;
 
+    box_idx = point_box_indices[i];
+    box_i = box_idx % n_boxes;
+    box_j = box_idx / n_boxes;
+    // all_interpolated_indices[n_terms * (i + N * (interp_i * n_interpolation_points + interp_j)) + d] - idx * n_terms + d 
+
+    interpolated_values[TID] = x_interpolated_values[i + interp_i * N] * y_interpolated_values[i + interp_j * N] * chargesQij[i * n_terms + current_term];
+    idx = (box_i * n_interpolation_points + interp_i) * (n_boxes * n_interpolation_points) +
+                                (box_j * n_interpolation_points) + interp_j;
+    interpolated_indices[TID] = idx * n_terms + current_term;
+}
 
 void precompute_2d(float x_max, float x_min, float y_max, float y_min, int n_boxes, int n_interpolation_points,
                    kernel_type_2d kernel, float *box_lower_bounds, float *box_upper_bounds, float *y_tilde_spacings,
@@ -319,26 +339,79 @@ void n_body_fft_2d(int N, int n_terms, float *xs, float *ys, float *chargesQij, 
     // auto *y_interpolated_values = new float[N * n_interpolation_points];
     // interpolate(n_interpolation_points, N, thrust::raw_pointer_cast(y_in_box.data()), y_tilde_spacings, y_interpolated_values, denominator);
 
-    auto *w_coefficients = new float[total_interpolation_points * n_terms]();
-    thrust::device_vecor<float> w_coefficients_device(total_interpolation_points * n_terms);
-    for (int i = 0; i < N; i++) {
-        int box_idx = point_box_idx[i];
-        int box_j = box_idx / n_boxes;
-        int box_i = box_idx % n_boxes;
-        for (int interp_i = 0; interp_i < n_interpolation_points; interp_i++) {
-            for (int interp_j = 0; interp_j < n_interpolation_points; interp_j++) {
-                // Compute the index of the point in the interpolation grid of points
-                int idx = (box_i * n_interpolation_points + interp_i) * (n_boxes * n_interpolation_points) +
-                          (box_j * n_interpolation_points) + interp_j;
-                for (int d = 0; d < n_terms; d++) {
-                    w_coefficients[idx * n_terms + d] +=
-                            y_interpolated_values[interp_j * N + i] *
-                            x_interpolated_values[interp_i * N + i] *
-                            chargesQij[i * n_terms + d];
-                }
-            }
-        }
-    }
+    
+    thrust::device_vector<float> all_interpolated_values_device(n_terms * n_interpolation_points * n_interpolation_points * N);
+    thrust::device_vector<int> all_interpolated_indices(n_terms * n_interpolation_points * n_interpolation_points * N);
+    thrust::device_vector<float> output_values(n_terms * n_interpolation_points * n_interpolation_points * N);
+    thrust::device_vector<int> output_indices(n_terms * n_interpolation_points * n_interpolation_points * N);
+    thrust::device_vector<float> w_coefficients_device(total_interpolation_points * n_terms);
+    thrust::device_vector<float> chargesQij_device(chargesQij, chargesQij + N * n_terms);
+    num_blocks = (n_terms * n_interpolation_points * n_interpolation_points * N + num_threads - 1) / num_threads;
+    compute_interpolated_indices<<<num_blocks, num_threads>>>(
+        thrust::raw_pointer_cast(all_interpolated_values_device.data()),
+        thrust::raw_pointer_cast(all_interpolated_indices.data()),
+        thrust::raw_pointer_cast(point_box_idx_device.data()),
+        thrust::raw_pointer_cast(chargesQij_device.data()),
+        thrust::raw_pointer_cast(x_interpolated_values_device.data()),
+        thrust::raw_pointer_cast(y_interpolated_values_device.data()),
+        N,
+        n_interpolation_points,
+        n_boxes,
+        n_terms
+    );
+    GpuErrorCheck(cudaDeviceSynchronize());
+
+    // for (int interp_i = 0; interp_i < n_interpolation_points; interp_i++) {
+    //     for (int interp_j = 0; interp_j < n_interpolation_points; interp_j++) {
+    //         // Compute the index of the point in the interpolation grid of points
+    //         thrust::transform(x_interpolated_values_device.begin() + interp_i * N,
+    //                           x_interpolated_values_device.begin() + interp_i * N + N,
+    //                           y_interpolated_values_device.begin() + interp_j * N,
+    //                           all_interpolated_values_device.begin() + N * (interp_i * n_interpolation_points + interp_j),
+    //                           thrust::multiplies<float>());
+    //     }
+    // }
+    thrust::sort_by_key(all_interpolated_indices.begin(), all_interpolated_indices.end(), all_interpolated_values_device.begin());
+
+    // std::cout << total_interpolation_points * n_terms << " " << thrust::reduce(all_interpolated_indices.begin(), all_interpolated_indices.end(), 0, thrust::minimum<int>()) << std::endl;
+   
+    auto new_end = thrust::reduce_by_key(thrust::device, all_interpolated_indices.begin(), all_interpolated_indices.end(), all_interpolated_values_device.begin(),
+                          output_indices.begin(), output_values.begin());
+    auto index_iterator = thrust::make_permutation_iterator(w_coefficients_device.begin(), output_indices.begin());
+    thrust::copy(output_values.begin(), new_end.second, index_iterator);
+
+    // thrust::device_vector<int> sorted_indices(total_interpolation_points);
+
+    // for (int d = 0; d < n_terms; d++) {
+    //     StridedIterator<Iterator> chargesQij_d(chargesQij.begin() + d, chargesQij.end(), n_terms);
+    //     StridedIterator<Iterator> w_coefficients_device_d(w_coefficients_device.begin() + d, w_coefficients_device.end(), n_terms);
+    //     thrust::reduce_by_key(all_interpolated_indices.begin(), all_interpolated_indices.end(), all_interpolated_values_device.begin(), 
+    //                         total_interpolation_points.begin(), );
+    // }
+    
+    // thrust::host_vector<float> all_interpolated_values(all_interpolated_values_device.begin(), all_interpolated_values_device.end());
+
+    // auto *w_coefficients = new float[total_interpolation_points * n_terms]();
+    
+    // for (int i = 0; i < N; i++) {
+    //     int box_idx = point_box_idx[i];
+    //     int box_j = box_idx / n_boxes;
+    //     int box_i = box_idx % n_boxes;
+    //     for (int interp_i = 0; interp_i < n_interpolation_points; interp_i++) {
+    //         for (int interp_j = 0; interp_j < n_interpolation_points; interp_j++) {
+    //             // Compute the index of the point in the interpolation grid of points
+    //             int idx = (box_i * n_interpolation_points + interp_i) * (n_boxes * n_interpolation_points) +
+    //                       (box_j * n_interpolation_points) + interp_j;
+    //             for (int d = 0; d < n_terms; d++) {
+    //                 w_coefficients[idx * n_terms + d] +=
+    //                         all_interpolated_values[n_terms * (i + N * (interp_i * n_interpolation_points + interp_j)) + d];
+    //                         // all_interpolated_values[i + N * (interp_i * n_interpolation_points + interp_j)] * 
+    //                         // chargesQij[i * n_terms + d];
+    //                 // std::cout << w_coefficients[idx * n_terms + d]
+    //             }
+    //         }
+    //     }
+    // }
 
         END_TIME("Step 1");
         START_TIME;
@@ -449,7 +522,7 @@ void n_body_fft_2d(int N, int n_terms, float *xs, float *ys, float *chargesQij, 
     // delete[] point_box_idx;
     // delete[] x_interpolated_values;
     // delete[] y_interpolated_values;
-    delete[] w_coefficients;
+    // delete[] w_coefficients;
     // delete[] y_tilde_values;
     // delete[] x_in_box;
     // delete[] y_in_box;
