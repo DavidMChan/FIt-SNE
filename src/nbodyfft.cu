@@ -4,7 +4,6 @@
 #include "time_code.h"
 #include "nbodyfft.h"
 #include <cufft.h>
-#include "common.h"
 #include "include/util/cuda_utils.h"
 #include <thrust/complex.h>
 #include "include/util/matrix_broadcast_utils.h"
@@ -291,13 +290,9 @@ void precompute_2d(float x_max, float x_min, float y_max, float y_min, int n_box
 void n_body_fft_2d(
     int N, 
     int n_terms, 
-    float *xs, 
-    float *ys, 
-    float *chargesQij, 
     int n_boxes,
     int n_interpolation_points, 
     complex<float> *fft_kernel_tilde,
-    float *potentialQij,
     const float *denominator,
     int n_total_boxes,
     int total_interpolation_points,
@@ -321,7 +316,8 @@ void n_body_fft_2d(
     thrust::device_vector<float> &w_coefficients_device,
     thrust::device_vector<float> &chargesQij_device,
     thrust::device_vector<float> &x_interpolated_values_device,
-    thrust::device_vector<float> &y_interpolated_values_device) {
+    thrust::device_vector<float> &y_interpolated_values_device,
+    thrust::device_vector<float> &potentialsQij_device) {
     // std::cout << "start" << std::endl;
     const int num_threads = 1024;
     int num_blocks = (N + num_threads - 1) / num_threads;
@@ -335,7 +331,6 @@ void n_body_fft_2d(
         thrust::complex<float> *) fft_kernel_tilde, ((thrust::complex<float> *) fft_kernel_tilde) + n_fft_coeffs * (n_fft_coeffs / 2 + 1));
     
     thrust::device_vector<float> fft_output(n_terms * n_fft_coeffs * n_fft_coeffs);
-    thrust::device_vector<float> potentialsQij_device(N * n_terms);
 
      // Compute box indices and the relative position of each point in its box in the interval [0, 1]
     compute_point_box_idx<<<num_blocks, num_threads>>>(
@@ -485,8 +480,6 @@ void n_body_fft_2d(
                           output_indices.begin(), output_values.begin());
     index_iterator = thrust::make_permutation_iterator(potentialsQij_device.begin(), output_indices.begin());
     thrust::copy(output_values.begin(), new_end.second, index_iterator);
-
-    thrust::copy(potentialsQij_device.begin(), potentialsQij_device.end(), potentialQij);
 
     cufftSafeCall(cufftDestroy(plan_dft));
     cufftSafeCall(cufftDestroy(plan_idft));
