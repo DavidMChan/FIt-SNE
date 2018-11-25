@@ -185,12 +185,43 @@ __global__ void compute_interpolated_indices(
     box_idx = point_box_indices[i];
     box_i = box_idx % n_boxes;
     box_j = box_idx / n_boxes;
-    // all_interpolated_indices[n_terms * (i + N * (interp_i * n_interpolation_points + interp_j)) + d] - idx * n_terms + d 
 
     interpolated_values[TID] = x_interpolated_values[i + interp_i * N] * y_interpolated_values[i + interp_j * N] * chargesQij[i * n_terms + current_term];
     idx = (box_i * n_interpolation_points + interp_i) * (n_boxes * n_interpolation_points) +
                                 (box_j * n_interpolation_points) + interp_j;
     interpolated_indices[TID] = idx * n_terms + current_term;
+}
+
+__global__ void compute_potential_indices(
+    volatile float * __restrict__ interpolated_values,
+    volatile int * __restrict__ interpolated_indices,
+    const int * const point_box_indices,
+    const float * const y_tilde_values,
+    const float * const x_interpolated_values,
+    const float * const y_interpolated_values,
+    const int N,
+    const int n_interpolation_points,
+    const int n_boxes,
+    const int n_terms)
+{
+    register int TID, current_term, i, interp_i, interp_j, box_idx, box_i, box_j, idx;
+    TID = threadIdx.x + blockIdx.x * blockDim.x;
+    if (TID >= n_terms * n_interpolation_points * n_interpolation_points * N)
+        return;
+    
+    current_term = TID % n_terms;
+    i = (TID / n_terms) % N;
+    interp_j = ((TID / n_terms) / N) % n_interpolation_points;
+    interp_i = ((TID / n_terms) / N) / n_interpolation_points;
+
+    box_idx = point_box_indices[i];
+    box_i = box_idx % n_boxes;
+    box_j = box_idx / n_boxes;
+
+    idx = (box_i * n_interpolation_points + interp_i) * (n_boxes * n_interpolation_points) +
+                                (box_j * n_interpolation_points) + interp_j;
+    interpolated_values[TID] = x_interpolated_values[i + interp_i * N] * y_interpolated_values[i + interp_j * N] * y_tilde_values[idx * n_terms + current_term];
+    interpolated_indices[TID] = i * n_terms + current_term;
 }
 
 void precompute_2d(float x_max, float x_min, float y_max, float y_min, int n_boxes, int n_interpolation_points,
@@ -257,27 +288,54 @@ void precompute_2d(float x_max, float x_min, float y_max, float y_min, int n_box
 }
 
 
-void n_body_fft_2d(int N, int n_terms, float *xs, float *ys, float *chargesQij, int n_boxes,
-                   int n_interpolation_points, float *box_lower_bounds, float *box_upper_bounds,
-                   float *y_tilde_spacings, complex<float> *fft_kernel_tilde, float *potentialQij, const float *denominator, unsigned int nthreads) {
+void n_body_fft_2d(
+    int N, 
+    int n_terms, 
+    float *xs, 
+    float *ys, 
+    float *chargesQij, 
+    int n_boxes,
+    int n_interpolation_points, 
+    complex<float> *fft_kernel_tilde,
+    float *potentialQij,
+    const float *denominator,
+    int n_total_boxes,
+    int total_interpolation_points,
+    float coord_min,
+    float box_width,
+    int n_fft_coeffs_half,
+    int n_fft_coeffs,
+    thrust::device_vector<int> &point_box_idx_device, 
+    thrust::device_vector<float> &x_in_box_device,
+    thrust::device_vector<float> &y_in_box_device,
+    thrust::device_vector<float> &xs_device,
+    thrust::device_vector<float> &ys_device,
+    thrust::device_vector<float> &box_lower_bounds_device,
+    thrust::device_vector<float> &y_tilde_spacings_device,
+    thrust::device_vector<float> &denominator_device,
+    thrust::device_vector<float> &y_tilde_values,
+    thrust::device_vector<float> &all_interpolated_values_device,
+    thrust::device_vector<float> &output_values,
+    thrust::device_vector<int> &all_interpolated_indices,
+    thrust::device_vector<int> &output_indices,
+    thrust::device_vector<float> &w_coefficients_device,
+    thrust::device_vector<float> &chargesQij_device,
+    thrust::device_vector<float> &x_interpolated_values_device,
+    thrust::device_vector<float> &y_interpolated_values_device) {
     // std::cout << "start" << std::endl;
     const int num_threads = 1024;
     int num_blocks = (N + num_threads - 1) / num_threads;
-    int n_total_boxes = n_boxes * n_boxes;
-    int total_interpolation_points = n_total_boxes * n_interpolation_points * n_interpolation_points;
+    
 
-    float coord_min = box_lower_bounds[0];
-    float box_width = box_upper_bounds[0] - box_lower_bounds[0];
-
-    // auto *point_box_idx = new int[N];
-    thrust::device_vector<int> point_box_idx_device(N);
-    thrust::device_vector<float> x_in_box_device(N);
-    thrust::device_vector<float> y_in_box_device(N);
-    thrust::device_vector<float> xs_device(xs, xs + N);
-    thrust::device_vector<float> ys_device(ys, ys + N);
-    thrust::device_vector<float> box_lower_bounds_device(box_lower_bounds, box_lower_bounds + 2 * n_total_boxes);
-    thrust::device_vector<float> y_tilde_spacings_device(y_tilde_spacings, y_tilde_spacings + n_interpolation_points);
-    thrust::device_vector<float> denominator_device(denominator, denominator + n_interpolation_points);
+    // CUDA vectors
+    thrust::device_vector<float> fft_input(n_terms * n_fft_coeffs * n_fft_coeffs);
+    thrust::device_vector<thrust::complex<float>> fft_w_coefficients(n_terms * n_fft_coeffs * (n_fft_coeffs / 2 + 1));
+    // std::cout << "starting copy" << std::endl;
+    thrust::device_vector<thrust::complex<float>> fft_kernel_tilde_device((
+        thrust::complex<float> *) fft_kernel_tilde, ((thrust::complex<float> *) fft_kernel_tilde) + n_fft_coeffs * (n_fft_coeffs / 2 + 1));
+    
+    thrust::device_vector<float> fft_output(n_terms * n_fft_coeffs * n_fft_coeffs);
+    thrust::device_vector<float> potentialsQij_device(N * n_terms);
 
      // Compute box indices and the relative position of each point in its box in the interval [0, 1]
     compute_point_box_idx<<<num_blocks, num_threads>>>(
@@ -295,20 +353,11 @@ void n_body_fft_2d(int N, int n_terms, float *xs, float *ys, float *chargesQij, 
     );
 
     GpuErrorCheck(cudaDeviceSynchronize());
-    thrust::host_vector<int> point_box_idx(point_box_idx_device.begin(), point_box_idx_device.end());
-    thrust::host_vector<float> x_in_box(x_in_box_device.begin(), x_in_box_device.end());
-    thrust::host_vector<float> y_in_box(y_in_box_device.begin(), y_in_box_device.end());
-
-    INITIALIZE_TIME
-    START_TIME
 
     /*
      * Step 1: Interpolate kernel using Lagrange polynomials and compute the w coefficients
      */
     // Compute the interpolated values at each real point with each Lagrange polynomial in the `x` direction
-    
-    thrust::device_vector<float> x_interpolated_values_device(N * n_interpolation_points);
-    thrust::device_vector<float> y_interpolated_values_device(N * n_interpolation_points);
 
     num_blocks = (N * n_interpolation_points + num_threads - 1) / num_threads;
     interpolate_device<<<num_blocks, num_threads>>>(
@@ -321,6 +370,7 @@ void n_body_fft_2d(int N, int n_terms, float *xs, float *ys, float *chargesQij, 
     );
     GpuErrorCheck(cudaDeviceSynchronize());
 
+    // Compute the interpolated values at each real point with each Lagrange polynomial in the `y` direction
     interpolate_device<<<num_blocks, num_threads>>>(
         thrust::raw_pointer_cast(y_interpolated_values_device.data()),
         thrust::raw_pointer_cast(y_in_box_device.data()),
@@ -330,22 +380,7 @@ void n_body_fft_2d(int N, int n_terms, float *xs, float *ys, float *chargesQij, 
         N
     );
     GpuErrorCheck(cudaDeviceSynchronize());
-
-    thrust::host_vector<float> x_interpolated_values(x_interpolated_values_device.begin(), x_interpolated_values_device.end());
-    thrust::host_vector<float> y_interpolated_values(y_interpolated_values_device.begin(), y_interpolated_values_device.end());
-    // auto *x_interpolated_values = new float[N * n_interpolation_points];
-    // interpolate(n_interpolation_points, N, thrust::raw_pointer_cast(x_in_box.data()), y_tilde_spacings, x_interpolated_values, denominator);
-    // // Compute the interpolated values at each real point with each Lagrange polynomial in the `y` direction
-    // auto *y_interpolated_values = new float[N * n_interpolation_points];
-    // interpolate(n_interpolation_points, N, thrust::raw_pointer_cast(y_in_box.data()), y_tilde_spacings, y_interpolated_values, denominator);
-
     
-    thrust::device_vector<float> all_interpolated_values_device(n_terms * n_interpolation_points * n_interpolation_points * N);
-    thrust::device_vector<int> all_interpolated_indices(n_terms * n_interpolation_points * n_interpolation_points * N);
-    thrust::device_vector<float> output_values(n_terms * n_interpolation_points * n_interpolation_points * N);
-    thrust::device_vector<int> output_indices(n_terms * n_interpolation_points * n_interpolation_points * N);
-    thrust::device_vector<float> w_coefficients_device(total_interpolation_points * n_terms);
-    thrust::device_vector<float> chargesQij_device(chargesQij, chargesQij + N * n_terms);
     num_blocks = (n_terms * n_interpolation_points * n_interpolation_points * N + num_threads - 1) / num_threads;
     compute_interpolated_indices<<<num_blocks, num_threads>>>(
         thrust::raw_pointer_cast(all_interpolated_values_device.data()),
@@ -361,81 +396,18 @@ void n_body_fft_2d(int N, int n_terms, float *xs, float *ys, float *chargesQij, 
     );
     GpuErrorCheck(cudaDeviceSynchronize());
 
-    // for (int interp_i = 0; interp_i < n_interpolation_points; interp_i++) {
-    //     for (int interp_j = 0; interp_j < n_interpolation_points; interp_j++) {
-    //         // Compute the index of the point in the interpolation grid of points
-    //         thrust::transform(x_interpolated_values_device.begin() + interp_i * N,
-    //                           x_interpolated_values_device.begin() + interp_i * N + N,
-    //                           y_interpolated_values_device.begin() + interp_j * N,
-    //                           all_interpolated_values_device.begin() + N * (interp_i * n_interpolation_points + interp_j),
-    //                           thrust::multiplies<float>());
-    //     }
-    // }
     thrust::sort_by_key(all_interpolated_indices.begin(), all_interpolated_indices.end(), all_interpolated_values_device.begin());
 
-    // std::cout << total_interpolation_points * n_terms << " " << thrust::reduce(all_interpolated_indices.begin(), all_interpolated_indices.end(), 0, thrust::minimum<int>()) << std::endl;
-   
     auto new_end = thrust::reduce_by_key(thrust::device, all_interpolated_indices.begin(), all_interpolated_indices.end(), all_interpolated_values_device.begin(),
                           output_indices.begin(), output_values.begin());
     auto index_iterator = thrust::make_permutation_iterator(w_coefficients_device.begin(), output_indices.begin());
     thrust::copy(output_values.begin(), new_end.second, index_iterator);
 
-    // thrust::device_vector<int> sorted_indices(total_interpolation_points);
-
-    // for (int d = 0; d < n_terms; d++) {
-    //     StridedIterator<Iterator> chargesQij_d(chargesQij.begin() + d, chargesQij.end(), n_terms);
-    //     StridedIterator<Iterator> w_coefficients_device_d(w_coefficients_device.begin() + d, w_coefficients_device.end(), n_terms);
-    //     thrust::reduce_by_key(all_interpolated_indices.begin(), all_interpolated_indices.end(), all_interpolated_values_device.begin(), 
-    //                         total_interpolation_points.begin(), );
-    // }
-    
-    // thrust::host_vector<float> all_interpolated_values(all_interpolated_values_device.begin(), all_interpolated_values_device.end());
-
-    // auto *w_coefficients = new float[total_interpolation_points * n_terms]();
-    
-    // for (int i = 0; i < N; i++) {
-    //     int box_idx = point_box_idx[i];
-    //     int box_j = box_idx / n_boxes;
-    //     int box_i = box_idx % n_boxes;
-    //     for (int interp_i = 0; interp_i < n_interpolation_points; interp_i++) {
-    //         for (int interp_j = 0; interp_j < n_interpolation_points; interp_j++) {
-    //             // Compute the index of the point in the interpolation grid of points
-    //             int idx = (box_i * n_interpolation_points + interp_i) * (n_boxes * n_interpolation_points) +
-    //                       (box_j * n_interpolation_points) + interp_j;
-    //             for (int d = 0; d < n_terms; d++) {
-    //                 w_coefficients[idx * n_terms + d] +=
-    //                         all_interpolated_values[n_terms * (i + N * (interp_i * n_interpolation_points + interp_j)) + d];
-    //                         // all_interpolated_values[i + N * (interp_i * n_interpolation_points + interp_j)] * 
-    //                         // chargesQij[i * n_terms + d];
-    //                 // std::cout << w_coefficients[idx * n_terms + d]
-    //             }
-    //         }
-    //     }
-    // }
-
-        END_TIME("Step 1");
-        START_TIME;
     /*
      * Step 2: Compute the values v_{m, n} at the equispaced nodes, multiply the kernel matrix with the coefficients w
      */
-    int n_fft_coeffs_half = n_interpolation_points * n_boxes;
-    int n_fft_coeffs = 2 * n_interpolation_points * n_boxes;
     
-    // thrust::device_vector<float> w_coefficients_device(w_coefficients, w_coefficients + (total_interpolation_points * n_terms ));
-    thrust::device_vector<float> y_tilde_values(total_interpolation_points * n_terms);
-
-    // FFT of fft_input
-    thrust::host_vector<float> y_tilde_values_host(total_interpolation_points * n_terms);
-
-    // CUDA vectors
-    thrust::device_vector<float> fft_input(n_terms * n_fft_coeffs * n_fft_coeffs);
-    thrust::device_vector<thrust::complex<float>> fft_w_coefficients(n_terms * n_fft_coeffs * (n_fft_coeffs / 2 + 1));
-    // std::cout << "starting copy" << std::endl;
-    thrust::device_vector<thrust::complex<float>> fft_kernel_tilde_device((
-        thrust::complex<float> *) fft_kernel_tilde, ((thrust::complex<float> *) fft_kernel_tilde) + n_fft_coeffs * (n_fft_coeffs / 2 + 1));
     
-    thrust::device_vector<float> fft_output(n_terms * n_fft_coeffs * n_fft_coeffs);
-
     // New CUFFT plans
     cufftHandle plan_dft, plan_idft;
     cufftSafeCall(cufftCreate(&plan_dft));
@@ -489,45 +461,35 @@ void n_body_fft_2d(int N, int n_terms, float *xs, float *ys, float *chargesQij, 
         n_terms
     );
     GpuErrorCheck(cudaDeviceSynchronize());
-
-    thrust::copy(y_tilde_values.begin(), y_tilde_values.end(), y_tilde_values_host.begin());
-
-    cufftSafeCall(cufftDestroy(plan_dft));
-    cufftSafeCall(cufftDestroy(plan_idft));
     
-    END_TIME("FFT");
-    START_TIME
     /*
      * Step 3: Compute the potentials \tilde{\phi}
      */
-    PARALLEL_FOR(nthreads,N, {
-        int box_idx = point_box_idx[loop_i];
-        int box_i = box_idx % n_boxes;
-        int box_j = box_idx / n_boxes;
-        for (int interp_i = 0; interp_i < n_interpolation_points; interp_i++) {
-            for (int interp_j = 0; interp_j < n_interpolation_points; interp_j++) {
-                for (int d = 0; d < n_terms; d++) {
-                    // Compute the index of the point in the interpolation grid of points
-                    int idx = (box_i * n_interpolation_points + interp_i) * (n_boxes * n_interpolation_points) +
-                              (box_j * n_interpolation_points) + interp_j;
-                    potentialQij[loop_i * n_terms + d] +=
-                            x_interpolated_values[interp_i * N + loop_i] *
-                            y_interpolated_values[interp_j * N + loop_i] *
-                            y_tilde_values_host[idx * n_terms + d];
-                }
-            }
-        }
-    });
-    END_TIME("Step 3");
-    // delete[] point_box_idx;
-    // delete[] x_interpolated_values;
-    // delete[] y_interpolated_values;
-    // delete[] w_coefficients;
-    // delete[] y_tilde_values;
-    // delete[] x_in_box;
-    // delete[] y_in_box;
+    num_blocks = (n_terms * n_interpolation_points * n_interpolation_points * N + num_threads - 1) / num_threads;
+    compute_potential_indices<<<num_blocks, num_threads>>>(
+        thrust::raw_pointer_cast(all_interpolated_values_device.data()),
+        thrust::raw_pointer_cast(all_interpolated_indices.data()),
+        thrust::raw_pointer_cast(point_box_idx_device.data()),
+        thrust::raw_pointer_cast(y_tilde_values.data()),
+        thrust::raw_pointer_cast(x_interpolated_values_device.data()),
+        thrust::raw_pointer_cast(y_interpolated_values_device.data()),
+        N,
+        n_interpolation_points,
+        n_boxes,
+        n_terms
+    );
+    GpuErrorCheck(cudaDeviceSynchronize());
+    thrust::sort_by_key(all_interpolated_indices.begin(), all_interpolated_indices.end(), all_interpolated_values_device.begin());
 
-    // std::cout << "done" << std::endl;
+    new_end = thrust::reduce_by_key(thrust::device, all_interpolated_indices.begin(), all_interpolated_indices.end(), all_interpolated_values_device.begin(),
+                          output_indices.begin(), output_values.begin());
+    index_iterator = thrust::make_permutation_iterator(potentialsQij_device.begin(), output_indices.begin());
+    thrust::copy(output_values.begin(), new_end.second, index_iterator);
+
+    thrust::copy(potentialsQij_device.begin(), potentialsQij_device.end(), potentialQij);
+
+    cufftSafeCall(cufftDestroy(plan_dft));
+    cufftSafeCall(cufftDestroy(plan_idft));
 }
 
 
