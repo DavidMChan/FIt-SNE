@@ -54,4 +54,6 @@ void n_body_fft_2d(
 void interpolate(int n_interpolation_points, int N, const float *y_in_box, const float *y_tilde_spacings,
                  float *interpolated_values, const float *denominator);
 
+float* get_ntime();
+
 #endif

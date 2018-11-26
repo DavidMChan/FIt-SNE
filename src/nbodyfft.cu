@@ -10,6 +10,11 @@
 
 #define cufftSafeCall(err)  __cufftSafeCall(err, __FILE__, __LINE__)
 
+clock_t _nbody_fft_timer;
+float _nbody_times[10];
+
+#define _ntime(x) _nbody_times[x] += ( (float) clock() - _nbody_fft_timer ) / CLOCKS_PER_SEC; _nbody_fft_timer = clock();
+
 static const char *_cudaGetErrorEnum(cufftResult error)
 {
     switch (error)
@@ -319,6 +324,7 @@ void n_body_fft_2d(
     thrust::device_vector<float> &y_interpolated_values_device,
     thrust::device_vector<float> &potentialsQij_device) {
     // std::cout << "start" << std::endl;
+    _ntime(0)
     const int num_threads = 1024;
     int num_blocks = (N + num_threads - 1) / num_threads;
     
@@ -331,7 +337,7 @@ void n_body_fft_2d(
         thrust::complex<float> *) fft_kernel_tilde, ((thrust::complex<float> *) fft_kernel_tilde) + n_fft_coeffs * (n_fft_coeffs / 2 + 1));
     
     thrust::device_vector<float> fft_output(n_terms * n_fft_coeffs * n_fft_coeffs);
-
+    _ntime(1)
      // Compute box indices and the relative position of each point in its box in the interval [0, 1]
     compute_point_box_idx<<<num_blocks, num_threads>>>(
         thrust::raw_pointer_cast(point_box_idx_device.data()),
@@ -348,7 +354,7 @@ void n_body_fft_2d(
     );
 
     GpuErrorCheck(cudaDeviceSynchronize());
-
+    _ntime(2)
     /*
      * Step 1: Interpolate kernel using Lagrange polynomials and compute the w coefficients
      */
@@ -375,7 +381,7 @@ void n_body_fft_2d(
         N
     );
     GpuErrorCheck(cudaDeviceSynchronize());
-    
+    _ntime(3)
     num_blocks = (n_terms * n_interpolation_points * n_interpolation_points * N + num_threads - 1) / num_threads;
     compute_interpolated_indices<<<num_blocks, num_threads>>>(
         thrust::raw_pointer_cast(all_interpolated_values_device.data()),
@@ -397,7 +403,7 @@ void n_body_fft_2d(
                           output_indices.begin(), output_values.begin());
     auto index_iterator = thrust::make_permutation_iterator(w_coefficients_device.begin(), output_indices.begin());
     thrust::copy(output_values.begin(), new_end.second, index_iterator);
-
+    _ntime(4)
     /*
      * Step 2: Compute the values v_{m, n} at the equispaced nodes, multiply the kernel matrix with the coefficients w
      */
@@ -418,7 +424,7 @@ void n_body_fft_2d(
                                     NULL, 1, n_fft_coeffs * (n_fft_coeffs / 2 + 1),
                                     NULL, 1, n_fft_coeffs * n_fft_coeffs,
                                     CUFFT_C2R, n_terms, &work_size_idft));
-    
+    _ntime(8)
     num_blocks = ((n_terms * n_fft_coeffs_half * n_fft_coeffs_half) + num_threads - 1) / num_threads;
     copy_to_fft_input<<<num_blocks, num_threads>>>(
         thrust::raw_pointer_cast(fft_input.data()),
@@ -428,7 +434,7 @@ void n_body_fft_2d(
         n_terms
     );
     GpuErrorCheck(cudaDeviceSynchronize());
-
+    _ntime(7)
     // Compute fft values at interpolated nodes
     cufftExecR2C(plan_dft, 
         reinterpret_cast<cufftReal *>(thrust::raw_pointer_cast(fft_input.data())), 
@@ -447,7 +453,7 @@ void n_body_fft_2d(
         reinterpret_cast<cufftComplex *>(thrust::raw_pointer_cast(fft_w_coefficients.data())), 
         reinterpret_cast<cufftReal *>(thrust::raw_pointer_cast(fft_output.data())));
     GpuErrorCheck(cudaDeviceSynchronize());
-
+    _ntime(9)
     copy_from_fft_output<<<num_blocks, num_threads>>>(
         thrust::raw_pointer_cast(y_tilde_values.data()),
         thrust::raw_pointer_cast(fft_output.data()),
@@ -456,7 +462,7 @@ void n_body_fft_2d(
         n_terms
     );
     GpuErrorCheck(cudaDeviceSynchronize());
-    
+    _ntime(5)
     /*
      * Step 3: Compute the potentials \tilde{\phi}
      */
@@ -483,6 +489,11 @@ void n_body_fft_2d(
 
     cufftSafeCall(cufftDestroy(plan_dft));
     cufftSafeCall(cufftDestroy(plan_idft));
+    _ntime(6)
+}
+
+float* get_ntime() {
+	return _nbody_times;
 }
 
 
