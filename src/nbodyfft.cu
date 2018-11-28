@@ -5,7 +5,6 @@
 #include "nbodyfft.h"
 #include <cufft.h>
 #include "include/util/cuda_utils.h"
-#include <thrust/complex.h>
 #include "include/util/matrix_broadcast_utils.h"
 
 #define cufftSafeCall(err)  __cufftSafeCall(err, __FILE__, __LINE__)
@@ -228,67 +227,106 @@ __global__ void compute_potential_indices(
     interpolated_indices[TID] = i * n_terms + current_term;
 }
 
+__host__ __device__ float squared_cauchy_2d(float x1, float x2, float y1, float y2) {
+    return pow(1.0 + pow(x1 - y1, 2) + pow(x2 - y2, 2), -2);
+}
+
+__global__ void compute_kernel_tilde(
+    volatile float * __restrict__ kernel_tilde,
+    const float x_min,
+    const float y_min,
+    const float h,
+    const int n_interpolation_points_1d,
+    const int n_fft_coeffs)
+{
+    register int TID, i, j;
+    register float tmp;
+    TID = threadIdx.x + blockIdx.x * blockDim.x;
+    if (TID >= n_interpolation_points_1d * n_interpolation_points_1d)
+        return;
+    
+    i = TID / n_interpolation_points_1d;
+    j = TID % n_interpolation_points_1d;
+
+    tmp = squared_cauchy_2d(y_min + h / 2, x_min + h / 2, y_min + h / 2 + i * h, x_min + h / 2 + j * h);
+    kernel_tilde[(n_interpolation_points_1d + i) * n_fft_coeffs + (n_interpolation_points_1d + j)] = tmp;
+    kernel_tilde[(n_interpolation_points_1d - i) * n_fft_coeffs + (n_interpolation_points_1d + j)] = tmp;
+    kernel_tilde[(n_interpolation_points_1d + i) * n_fft_coeffs + (n_interpolation_points_1d - j)] = tmp;
+    kernel_tilde[(n_interpolation_points_1d - i) * n_fft_coeffs + (n_interpolation_points_1d - j)] = tmp;
+    
+} 
+
+__global__ void compute_upper_and_lower_bounds(
+    volatile float * __restrict__ box_upper_bounds,
+    volatile float * __restrict__ box_lower_bounds,
+    const float box_width,
+    const float x_min,
+    const float y_min,
+    const int n_boxes,
+    const int n_total_boxes)
+{
+    register int TID, i, j;
+    TID = threadIdx.x + blockIdx.x * blockDim.x;
+    if (TID >= n_boxes * n_boxes)
+        return;
+
+    i = TID / n_boxes;
+    j = TID % n_boxes;
+
+    box_lower_bounds[i * n_boxes + j] = j * box_width + x_min;
+    box_upper_bounds[i * n_boxes + j] = (j + 1) * box_width + x_min;
+
+    box_lower_bounds[n_total_boxes + i * n_boxes + j] = i * box_width + y_min;
+    box_upper_bounds[n_total_boxes + i * n_boxes + j] = (i + 1) * box_width + y_min;
+}
+
 void precompute_2d(float x_max, float x_min, float y_max, float y_min, int n_boxes, int n_interpolation_points,
-                   kernel_type_2d kernel, float *box_lower_bounds, float *box_upper_bounds, float *y_tilde_spacings,
-                   float *y_tilde, float *x_tilde, complex<float> *fft_kernel_tilde) {
+                   kernel_type_2d kernel, thrust::device_vector<float> &box_lower_bounds_device, thrust::device_vector<float> &box_upper_bounds_device, 
+                   thrust::device_vector<thrust::complex<float>> &fft_kernel_tilde_device) {
+    const int num_threads = 32;
+    int num_blocks = (n_boxes * n_boxes + num_threads - 1) / num_threads;
     /*
      * Set up the boxes
      */
     int n_total_boxes = n_boxes * n_boxes;
     float box_width = (x_max - x_min) / (float) n_boxes;
-
+    
     // Left and right bounds of each box, first the lower bounds in the x direction, then in the y direction
-    for (int i = 0; i < n_boxes; i++) {
-        for (int j = 0; j < n_boxes; j++) {
-            box_lower_bounds[i * n_boxes + j] = j * box_width + x_min;
-            box_upper_bounds[i * n_boxes + j] = (j + 1) * box_width + x_min;
-
-            box_lower_bounds[n_total_boxes + i * n_boxes + j] = i * box_width + y_min;
-            box_upper_bounds[n_total_boxes + i * n_boxes + j] = (i + 1) * box_width + y_min;
-        }
-    }
-
-    // Coordinates of each (equispaced) interpolation node for a single box
-    float h = 1 / (float) n_interpolation_points;
-    y_tilde_spacings[0] = h / 2;
-    for (int i = 1; i < n_interpolation_points; i++) {
-        y_tilde_spacings[i] = y_tilde_spacings[i - 1] + h;
-    }
+    compute_upper_and_lower_bounds<<<num_blocks, num_threads>>>(
+        thrust::raw_pointer_cast(box_upper_bounds_device.data()),
+        thrust::raw_pointer_cast(box_lower_bounds_device.data()),
+        box_width, x_min, y_min, n_boxes, n_total_boxes);
 
     // Coordinates of all the equispaced interpolation points
     int n_interpolation_points_1d = n_interpolation_points * n_boxes;
     int n_fft_coeffs = 2 * n_interpolation_points_1d;
 
-    h = h * box_width;
-    x_tilde[0] = x_min + h / 2;
-    y_tilde[0] = y_min + h / 2;
-    for (int i = 1; i < n_interpolation_points_1d; i++) {
-        x_tilde[i] = x_tilde[i - 1] + h;
-        y_tilde[i] = y_tilde[i - 1] + h;
-    }
+    float h = box_width / (float) n_interpolation_points;
+    // h = h * box_width;
 
     /*
      * Evaluate the kernel at the interpolation nodes and form the embedded generating kernel vector for a circulant
      * matrix
      */
-    auto *kernel_tilde = new float[n_fft_coeffs * n_fft_coeffs]();
-    for (int i = 0; i < n_interpolation_points_1d; i++) {
-        for (int j = 0; j < n_interpolation_points_1d; j++) {
-            float tmp = kernel(y_tilde[0], x_tilde[0], y_tilde[i], x_tilde[j]);
-            kernel_tilde[(n_interpolation_points_1d + i) * n_fft_coeffs + (n_interpolation_points_1d + j)] = tmp;
-            kernel_tilde[(n_interpolation_points_1d - i) * n_fft_coeffs + (n_interpolation_points_1d + j)] = tmp;
-            kernel_tilde[(n_interpolation_points_1d + i) * n_fft_coeffs + (n_interpolation_points_1d - j)] = tmp;
-            kernel_tilde[(n_interpolation_points_1d - i) * n_fft_coeffs + (n_interpolation_points_1d - j)] = tmp;
-        }
-    }
-
+    thrust::device_vector<float> kernel_tilde_device(n_fft_coeffs * n_fft_coeffs);
+    num_blocks = (n_interpolation_points_1d * n_interpolation_points_1d + num_threads - 1) / num_threads;
+    compute_kernel_tilde<<<num_blocks, num_threads>>>(
+        thrust::raw_pointer_cast(kernel_tilde_device.data()), 
+        x_min, y_min, h, n_interpolation_points_1d, n_fft_coeffs);
+    GpuErrorCheck(cudaDeviceSynchronize());
+    
     // Precompute the FFT of the kernel generating matrix
-    fftwf_plan p = fftwf_plan_dft_r2c_2d(n_fft_coeffs, n_fft_coeffs, kernel_tilde,
-                                       reinterpret_cast<fftwf_complex *>(fft_kernel_tilde), FFTW_ESTIMATE);
-    fftwf_execute(p);
-
-    fftwf_destroy_plan(p);
-    delete[] kernel_tilde;
+    cufftHandle plan_kernel_tilde;
+    cufftSafeCall(cufftCreate(&plan_kernel_tilde));
+    size_t work_size;
+    cufftSafeCall(cufftMakePlan2d(plan_kernel_tilde, n_fft_coeffs, n_fft_coeffs, CUFFT_R2C, &work_size));
+    // thrust::device_vector<thrust::complex<float>> fft_kernel_tilde_device(2 * n_interpolation_points_1d * 2 * n_interpolation_points_1d);
+    cufftExecR2C(plan_kernel_tilde, 
+        reinterpret_cast<cufftReal *>(thrust::raw_pointer_cast(kernel_tilde_device.data())),
+        reinterpret_cast<cufftComplex *>(thrust::raw_pointer_cast(fft_kernel_tilde_device.data())));
+    // thrust::copy(fft_kernel_tilde_device.begin(), fft_kernel_tilde_device.end(), (thrust::complex<float> *) fft_kernel_tilde);
+    cufftSafeCall(cufftDestroy(plan_kernel_tilde));
+    // delete[] kernel_tilde;
 }
 
 
@@ -297,8 +335,7 @@ void n_body_fft_2d(
     int n_terms, 
     int n_boxes,
     int n_interpolation_points, 
-    complex<float> *fft_kernel_tilde,
-    const float *denominator,
+    thrust::device_vector<thrust::complex<float>> &fft_kernel_tilde_device,
     int n_total_boxes,
     int total_interpolation_points,
     float coord_min,
@@ -333,8 +370,8 @@ void n_body_fft_2d(
     thrust::device_vector<float> fft_input(n_terms * n_fft_coeffs * n_fft_coeffs);
     thrust::device_vector<thrust::complex<float>> fft_w_coefficients(n_terms * n_fft_coeffs * (n_fft_coeffs / 2 + 1));
     // std::cout << "starting copy" << std::endl;
-    thrust::device_vector<thrust::complex<float>> fft_kernel_tilde_device((
-        thrust::complex<float> *) fft_kernel_tilde, ((thrust::complex<float> *) fft_kernel_tilde) + n_fft_coeffs * (n_fft_coeffs / 2 + 1));
+    // thrust::device_vector<thrust::complex<float>> fft_kernel_tilde_device((
+        // thrust::complex<float> *) fft_kernel_tilde, ((thrust::complex<float> *) fft_kernel_tilde) + n_fft_coeffs * (n_fft_coeffs / 2 + 1));
     
     thrust::device_vector<float> fft_output(n_terms * n_fft_coeffs * n_fft_coeffs);
     _ntime(1)

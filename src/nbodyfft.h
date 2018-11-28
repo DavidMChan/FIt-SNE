@@ -8,6 +8,7 @@
 #endif
 #include <complex>
 #include "common.h"
+#include <thrust/complex.h>
 
 using namespace std;
 
@@ -16,16 +17,15 @@ typedef float (*kernel_type)(float, float);
 typedef float (*kernel_type_2d)(float, float, float, float);
 
 void precompute_2d(float x_max, float x_min, float y_max, float y_min, int n_boxes, int n_interpolation_points,
-                   kernel_type_2d kernel, float *box_lower_bounds, float *box_upper_bounds, float *y_tilde_spacings,
-                   float *y_tilde, float *x_tilde, complex<float> *fft_kernel_tilde);
+                   kernel_type_2d kernel, thrust::device_vector<float> &box_lower_bounds_device, thrust::device_vector<float> &box_upper_bounds_device,
+                   thrust::device_vector<thrust::complex<float>> &fft_kernel_tilde_device);
 
 void n_body_fft_2d(
     int N, 
     int n_terms, 
     int n_boxes,
     int n_interpolation_points, 
-    complex<float> *fft_kernel_tilde,
-    const float *denominator,
+    thrust::device_vector<thrust::complex<float>> &fft_kernel_tilde_device,
     int n_total_boxes,
     int total_interpolation_points,
     float coord_min,
