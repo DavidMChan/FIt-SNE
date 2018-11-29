@@ -16,11 +16,13 @@ typedef float (*kernel_type)(float, float);
 
 typedef float (*kernel_type_2d)(float, float, float, float);
 
-void precompute_2d(float x_max, float x_min, float y_max, float y_min, int n_boxes, int n_interpolation_points,
-                   kernel_type_2d kernel, thrust::device_vector<float> &box_lower_bounds_device, thrust::device_vector<float> &box_upper_bounds_device,
-                   thrust::device_vector<thrust::complex<float>> &fft_kernel_tilde_device);
+void precompute_2d(cufftHandle &plan_kernel_tilde, float x_max, float x_min, float y_max, float y_min, int n_boxes, int n_interpolation_points,
+                   thrust::device_vector<float> &box_lower_bounds_device, thrust::device_vector<float> &box_upper_bounds_device, 
+                   thrust::device_vector<float> &kernel_tilde_device, thrust::device_vector<thrust::complex<float>> &fft_kernel_tilde_device);
 
 void n_body_fft_2d(
+    cufftHandle &plan_dft,
+    cufftHandle &plan_idft,
     int N, 
     int n_terms, 
     int n_boxes,
@@ -32,11 +34,14 @@ void n_body_fft_2d(
     float box_width,
     int n_fft_coeffs_half,
     int n_fft_coeffs,
+    int num_nodes,
+    thrust::device_vector<float> &fft_input,
+    thrust::device_vector<thrust::complex<float>> &fft_w_coefficients,
+    thrust::device_vector<float> &fft_output,
     thrust::device_vector<int> &point_box_idx_device, 
     thrust::device_vector<float> &x_in_box_device,
     thrust::device_vector<float> &y_in_box_device,
-    thrust::device_vector<float> &xs_device,
-    thrust::device_vector<float> &ys_device,
+    thrust::device_vector<float> &points_device,
     thrust::device_vector<float> &box_lower_bounds_device,
     thrust::device_vector<float> &y_tilde_spacings_device,
     thrust::device_vector<float> &denominator_device,
